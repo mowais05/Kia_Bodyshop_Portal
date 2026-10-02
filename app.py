@@ -1,4 +1,6 @@
+import base64
 import html
+import io
 import os
 import re
 import time
@@ -7,6 +9,7 @@ from datetime import datetime
 
 import pandas as pd
 import pytz
+import requests
 import streamlit as st
 from filelock import FileLock
 
@@ -18,10 +21,10 @@ st.set_page_config(page_title="Kia Bodyshop", layout="wide", page_icon="🚗", i
 BRAND = "Kia"
 BRAND_HI = "किआ"
 
-DB_FILE = "claim_database.csv"
-GUARD_FILE = "guard_entry.csv"
-DB_LOCK = "claim_database.csv.lock"
-GUARD_LOCK = "guard_entry.csv.lock"
+DB_FILE = "claim_database.xlsx"
+GUARD_FILE = "guard_entry.xlsx"
+DB_LOCK = "claim_database.xlsx.lock"
+GUARD_LOCK = "guard_entry.xlsx.lock"
 
 # NOTE: kept exactly as before so the shared link keeps working. Update it if you move the app.
 WEB_URL = "https://mahendra-bodyshop-pnzpwm5nbeok4x5usgtntb.streamlit.app/"
@@ -250,13 +253,81 @@ def get_next_status(current):
     return "Next process update soon"
 
 
-def _read_csv(path, cols):
-    """Read a CSV safely: missing file / empty file / missing columns are all handled."""
-    if not os.path.exists(path) or os.path.getsize(path) == 0:
+# ---------------------------------------------------------------------
+#  STORAGE LAYER  ->  Excel files stored in your GitHub repo
+#  (falls back to local .xlsx files if GitHub secrets are not set)
+# ---------------------------------------------------------------------
+def github_config():
+    """Returns (token, repo, branch, folder) or None when GitHub is not configured."""
+    try:
+        token = str(st.secrets["GITHUB_TOKEN"]).strip()
+        repo = str(st.secrets["GITHUB_REPO"]).strip()
+    except Exception:
+        return None
+    branch = str(st.secrets.get("GITHUB_BRANCH", "main")).strip()
+    folder = str(st.secrets.get("GITHUB_DATA_DIR", "data")).strip().strip("/")
+    return token, repo, branch, folder
+
+
+def _gh_url(cfg, path):
+    _, repo, _, folder = cfg
+    return f"https://api.github.com/repos/{repo}/contents/{folder + '/' if folder else ''}{path}"
+
+
+def _gh_headers(cfg, accept="application/vnd.github+json"):
+    return {"Authorization": f"Bearer {cfg[0]}", "Accept": accept, "X-GitHub-Api-Version": "2022-11-28"}
+
+
+def _gh_get(cfg, path):
+    """Returns (file_bytes, sha) or (None, None) if the file does not exist yet."""
+    url, params = _gh_url(cfg, path), {"ref": cfg[2]}
+    r = requests.get(url, headers=_gh_headers(cfg), params=params, timeout=25)
+    if r.status_code == 404:
+        return None, None
+    r.raise_for_status()
+    meta = r.json()
+    if meta.get("content"):
+        return base64.b64decode(meta["content"]), meta["sha"]
+    raw = requests.get(url, headers=_gh_headers(cfg, "application/vnd.github.raw"), params=params, timeout=25)
+    raw.raise_for_status()
+    return raw.content, meta["sha"]
+
+
+def _gh_put(cfg, path, data, message):
+    """Create/update a file. Retries with a fresh SHA if GitHub reports a conflict."""
+    url = _gh_url(cfg, path)
+    for _ in range(3):
+        _, sha = _gh_get(cfg, path)
+        body = {"message": message, "content": base64.b64encode(data).decode(), "branch": cfg[2]}
+        if sha:
+            body["sha"] = sha
+        r = requests.put(url, headers=_gh_headers(cfg), json=body, timeout=40)
+        if r.status_code in (409, 422):
+            time.sleep(1)
+            continue
+        r.raise_for_status()
+        return
+    raise RuntimeError("GitHub kept reporting a conflict. Please try again.")
+
+
+def _df_to_xlsx_bytes(df):
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Data")
+        ws = writer.sheets["Data"]
+        for col_cells in ws.columns:
+            width = max(len(str(c.value)) if c.value is not None else 0 for c in col_cells)
+            ws.column_dimensions[col_cells[0].column_letter].width = min(max(width + 2, 12), 45)
+        ws.freeze_panes = "A2"
+    return buf.getvalue()
+
+
+def _xlsx_bytes_to_df(data, cols):
+    if not data:
         return pd.DataFrame(columns=cols)
     try:
-        df = pd.read_csv(path, dtype=str, keep_default_na=False)
-    except pd.errors.EmptyDataError:
+        df = pd.read_excel(io.BytesIO(data), dtype=str, engine="openpyxl").fillna("")
+    except Exception:
         return pd.DataFrame(columns=cols)
     for c in cols:
         if c not in df.columns:
@@ -264,27 +335,59 @@ def _read_csv(path, cols):
     return df.reset_index(drop=True)
 
 
+def _read_csv(path, cols):
+    """(Name kept for compatibility.) Reads the Excel file from GitHub, or locally as a fallback."""
+    cfg = github_config()
+    if cfg:
+        try:
+            data, _ = _gh_get(cfg, path)
+        except Exception as e:
+            # Never continue with an empty table - the next save would wipe the real data.
+            st.error(f"Could not read data from GitHub: {e}")
+            st.stop()
+        return _xlsx_bytes_to_df(data, cols)
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return pd.DataFrame(columns=cols)
+    with open(path, "rb") as f:
+        return _xlsx_bytes_to_df(f.read(), cols)
+
+
+def _write(path, df):
+    data = _df_to_xlsx_bytes(df)
+    cfg = github_config()
+    if cfg:
+        try:
+            _gh_put(cfg, path, data, f"Update {path} - {ts_string(get_india_time())}")
+        except Exception as e:
+            st.error(f"Could not save to GitHub - changes NOT saved: {e}")
+            st.stop()
+    else:
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    _cached_read.clear()
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def _cached_read(path, cols):
+    return _read_csv(path, list(cols))
+
+
 def load_data():
-    with FileLock(DB_LOCK):
-        return _read_csv(DB_FILE, ALL_COLS)
+    return _cached_read(DB_FILE, tuple(ALL_COLS)).copy()
 
 
 def load_guard_data():
-    with FileLock(GUARD_LOCK):
-        return _read_csv(GUARD_FILE, GUARD_COLS)
+    return _cached_read(GUARD_FILE, tuple(GUARD_COLS)).copy()
 
 
 def save_data(df):
-    """Atomic write (temp file + replace) so a crash can never corrupt the database."""
-    tmp = DB_FILE + ".tmp"
-    df.to_csv(tmp, index=False)
-    os.replace(tmp, DB_FILE)
+    _write(DB_FILE, df)
 
 
 def save_guard(df):
-    tmp = GUARD_FILE + ".tmp"
-    df.to_csv(tmp, index=False)
-    os.replace(tmp, GUARD_FILE)
+    _write(GUARD_FILE, df)
 
 
 def update_car(car_number, status, delivery_date, remark):
@@ -347,6 +450,10 @@ def build_stepper(status):
 #  SIDEBAR / NAVIGATION
 # =====================================================================
 st.sidebar.markdown(f"### 🛠️ {BRAND} Bodyshop")
+if github_config():
+    st.sidebar.caption("☁️ Data saved to GitHub (Excel)")
+else:
+    st.sidebar.caption("⚠️ GitHub not connected - saving locally")
 menu = st.sidebar.radio("Navigation", ["Customer Portal / ग्राहक पोर्टल", "Guard Portal / गार्ड पोर्टल", "Staff Dashboard / स्टाफ"], index=0)
 
 # =====================================================================
